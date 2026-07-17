@@ -1,87 +1,90 @@
-# 把 a-share-rank-tracker 接入 Max Dama 研究审计
+# 把 A 股看板的 Max Dama 研究门槛接入 Vibe-Trading
 
-这个适配器连接你现有的两部分：
+本适配器连接两个已经分工明确的系统：
 
 ```text
 a-share-rank-tracker
   main_rise_watch.json
-  main_rise_audit.json
+  main_rise_audit.json#max_dama_research_gate
   main_rise_outcomes.json
-  history/main_rise_watch/*.json
-          ↓
+              ↓
 a_share_rank_research_snapshot
-  成本情景 + Alpha 衰减 + 流动性/容量代理 + 仓位上限
-          ↓
-~/.vibe-trading/a-share-rank-research/<run_id>/result.normalized.json
-          ↓
+  固化源文件、Git commit、研究门槛与仓位上限
+              ↓
+~/.vibe-trading/a-share-rank-research/<run_id>/
+              ↓
 max_dama_audit
 ```
 
-它不会重算或改写当日候选，不会调阈值，也不会连接券商或生成订单。原项目仍然是盘后条件观察；新增层只把已有的前瞻结果变成统一、可审计的研究证据。
+## 单一计算来源
 
-## 一、具体提取了什么
-
-### 1. Alpha 契约
-
-把当前互斥状态固定为：
-
-- `breakout_watch`
-- `pre_breakout_watch`
-- `technical_confirmed`
-- `overheat_isolation` 仅作为隔离对照，不进入正向 Alpha 池
-
-预测口径沿用原框架：盘后形成信号，下一交易日开盘为参考入场，跟踪 1、3、5、10 个交易日。适配器按状态和周期汇总毛收益、超额收益、MFE、MAE，并在样本足够后尝试估计净超额收益的半衰期。
-
-### 2. 成本后结果
-
-原 `main_rise_outcomes.json` 是描述性毛收益。适配器在独立产物中应用操作员配置的成本情景：
+Alpha 样本、固定成本后的净超额收益、Alpha 衰减、执行证据、事件级风险和容量代理，统一由 `a-share-rank-tracker` 的盘后流水线生成：
 
 ```text
-净收益 = 目标收盘价 × (1 - 卖出成本)
-        / [参考开盘价 × (1 + 买入成本)] - 1
+main_rise_audit.json → max_dama_research_gate
 ```
 
-默认示例有 `baseline / stress / severe` 三档，但这些数字只是本地研究假设：它们不声称等于当前法定税费、你的券商佣金或真实成交滑点。你应按自己的账户和成交记录维护配置。
+Vibe 适配器不再重复计算这些指标。它只做三件事：
 
-### 3. 容量诊断
+1. 核验日期、Git commit、工作树和源文件哈希；
+2. 把看板研究门槛固化成可复现的 Vibe run；
+3. 将该 run 交给 `max_dama_audit` 做研究／晋级审计。
 
-从信号日归档快照读取 `technical.turnover_cny_20d`，计算 1%、5%、10% 市场成交参与率下的单标的名义资金代理，并生成平方根冲击代理：
+这样可以避免看板与 Agent 使用不同的样本、半衰期或容量口径。
 
-```text
-冲击 bps 代理 = impact_coefficient_bps × sqrt(参与率)
+## 安全边界
+
+- 不改写 `main_rise_watch` 候选状态；
+- 不调整策略阈值；
+- 不读取模型提交的任意文件路径或命令；
+- 不连接券商、钱包或下单接口；
+- 尚未成熟的 horizon 保持 `pending`，不当作失败样本；
+- 不可用和异常完整结果单独记录；
+- 容量始终是成交额／参与率诊断，未经验证不称为可执行容量；
+- 任何研究警告都会阻止 promotion；
+- `live_execution_allowed` 固定为 `false`。
+
+## 前置条件
+
+A 股仓库必须已经运行：
+
+```bash
+python main_rise_audit_job.py finalize
+python cost_aware_audit_job.py --round-trip-cost-bps 20
+python max_dama_dashboard_job.py
 ```
 
-这不是策略容量结论。日均成交额不能替代盘口深度、开盘集合竞价、涨跌停、停牌、部分成交和并发持仓分析。因此输出固定标为 `diagnostic_only`，晋级审计会拒绝把它当成实盘级容量证据。
+完成后，`main_rise_audit.json` 中应存在：
 
-### 4. 风险与仓位
+```json
+{
+  "max_dama_research_gate": {
+    "method": "max_dama_research_gate_v1",
+    "policies": {
+      "live_execution_allowed": false
+    }
+  }
+}
+```
 
-适配器保留当前前端仓位层级的含义：
+若该门槛缺失、日期不一致或未明确关闭实盘，Vibe 快照会拒绝生成。
 
-- 无正向候选：`0%`
-- 仅技术确认：上限 `5%`
-- 突破前观察：上限 `10%`
-- 收盘突破观察：上限 `20%`
-- 覆盖不足、未知项或单一候选集中时自动降档
-- 单一标的上限由配置控制，示例为 `5%`
+## 安装
 
-这仍是**下一交易日新增总敞口的规则上限**，不是凯利仓位。因为当前没有重叠持仓路径、组合净值、实际成交和尾部故障回放，所以风险证据固定标为 `event_level_only`。
-
-## 二、配置
-
-先安装 Max Dama 共同审计层，再执行：
+在 Vibe-Trading 仓库根目录执行：
 
 ```bash
 bash examples/a_share_rank_research_adapter/setup.sh \
   /你的绝对路径/a-share-rank-tracker
 ```
 
-它会创建：
+安装脚本会创建：
 
 ```text
 ~/.vibe-trading/a_share_rank_research.json
 ```
 
-并在已有的 `~/.vibe-trading/max_dama_research.json` 中增加：
+并把以下引擎目录加入已有的 `max_dama_research.json`：
 
 ```json
 {
@@ -91,33 +94,36 @@ bash examples/a_share_rank_research_adapter/setup.sh \
 }
 ```
 
-模型不能提交仓库路径、输出路径、成本值、容量系数或任意命令；这些均由操作员配置控制。工具只接受一个可选的 `as_of=YYYYMMDD` 日期护栏，而且必须与当前三份源文件的日期完全一致。
+配置示例：
 
-## 三、使用顺序
-
-对话中输入：
-
-```text
-先调用 a_share_rank_research_info，核验固定仓库、Git commit、工作树状态、
-成本情景和容量参数。然后调用 a_share_rank_research_snapshot。
-把返回的 engine=a_share_rank_tracker 与 run_id 交给 max_dama_audit，
-先使用 research 级别。成交、容量、组合回撤和凯利证据未独立验证前，
-不得使用 promotion 结果，更不得授权实盘。
+```json
+{
+  "repo_root": "/ABSOLUTE/PATH/TO/a-share-rank-tracker",
+  "output_root": "~/.vibe-trading/a-share-rank-research",
+  "max_source_bytes": 25000000,
+  "max_position_cap": 0.20,
+  "single_name_cap": 0.05,
+  "require_clean_worktree": true
+}
 ```
 
-等价流程：
+路径和上限只能由操作员配置，模型调用时不能覆盖。
+
+## 使用顺序
 
 ```text
 a_share_rank_research_info
 → a_share_rank_research_snapshot(as_of="YYYYMMDD")
 → max_dama_audit(
      engine="a_share_rank_tracker",
-     run_id="返回值",
+     run_id="快照返回的 run_id",
      audit_level="research"
    )
 ```
 
-## 四、每次快照写出的产物
+需要检查晋级门槛时，可以把 `audit_level` 改为 `promotion`。只要样本、执行、组合风险、成本压力或容量仍有待补证据，结果就会是 `blocked`。
+
+## 每次快照产物
 
 ```text
 request.json
@@ -128,45 +134,31 @@ event_outcomes.normalized.json
 cost_capacity_diagnostics.json
 ```
 
-`run_id` 由源日期、源文件哈希和研究配置哈希确定。相同代码、数据和配置重复运行会落到同一个可复现目录。
+`run_id` 由以下稳定输入确定：
 
-`source_manifest.json` 记录：
+- A 股仓库 Git commit；
+- 三份源文件 SHA-256；
+- 看板 gate 的 `run_id`；
+- 不含本地绝对路径的适配器参数。
 
-- a-share-rank-tracker Git commit；
-- 工作树是否干净；
-- 三份当前文件与所有已使用历史快照的 SHA-256；
-- 成本、容量和仓位配置的 SHA-256。
+因此，相同代码、数据与配置在不同本地目录中会得到相同 `run_id`。
 
-默认要求源仓库工作树干净，否则拒绝生成快照。
+## 合理的当前结果
 
-## 五、审计状态怎么解释
-
-在现阶段，合理结果通常是：
+样本仍在积累时，常见结果是：
 
 ```text
-时间一致性             pass
-前瞻/滚动样本外         pass
-参数政策               pass（阈值冻结、自动调参关闭）
-Alpha 半衰期            warn（样本不足时）
-执行                   warn（成本诊断有，实际成交未验证）
-风险                   warn（事件级 MAE 有，组合回撤/凯利没有）
-容量                   warn（ADV 代理有，真实容量没有）
-有效样本数             warn（低于门槛时）
-净经济性               warn（主周期样本未成熟时不输出结论）
+可复现输入          pass
+时间一致性          pass
+自动调参关闭        pass
+实盘执行关闭        pass
+主周期样本          warn
+成本后净 Alpha      warn
+Alpha 半衰期        warn
+执行证据            warn
+组合风险            warn
+容量证据            warn
+promotion           blocked
 ```
 
-这正是预期行为：把“已有证据”和“仍缺证据”分开，而不是为了得到绿色结果而伪造精度。
-
-## 六、从 collecting 到 promotion 还缺什么
-
-只有补齐以下独立证据，才适合讨论晋级：
-
-1. 主周期至少达到配置的独立正向事件门槛；
-2. 参数邻域或冻结版本的滚动样本外比较；
-3. 涨跌停、停牌、集合竞价、开盘不可成交与部分成交模拟；
-4. 实际券商成交与模型成本的逐笔对账；
-5. 并发持仓、行业集中、组合净值与最大回撤；
-6. 压力情景下的尾部损失和分数凯利/风险预算；
-7. 资金规模变化时，净 Alpha 随参与率和冲击的边际曲线。
-
-适配器不会自动放宽门槛，也不会用当前少量样本回写 `main_rise_watch` 阈值。
+这表示研究链已经接通，但证据尚不足以晋级；它不是策略失败，也不是买卖建议。
