@@ -1,4 +1,4 @@
-"""Read-only bridge from a-share-rank-tracker artifacts to Max Dama research evidence."""
+"""Read-only bridge from the dashboard's Max Dama gate into Vibe research runs."""
 from __future__ import annotations
 
 import hashlib
@@ -7,14 +7,12 @@ import math
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import mean, median
 from typing import Any, Mapping
 
 from src.agent.tools import BaseTool
 
 CONFIG_NAME = "a_share_rank_research.json"
-POSITIVE_STATES = ("breakout_watch", "pre_breakout_watch", "technical_confirmed")
-HORIZONS = (1, 3, 5, 10)
+TOOL_VERSION = 2
 
 
 def _config_path() -> Path:
@@ -22,7 +20,10 @@ def _config_path() -> Path:
 
 
 def _load(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read valid JSON: {path}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return value
@@ -30,63 +31,146 @@ def _load(path: Path) -> dict[str, Any]:
 
 def _write(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _number(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
+def _json_sha(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _number(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
 
 def _git(repo: Path) -> dict[str, Any]:
     def run(*args: str) -> str:
-        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
-    return {"commit": run("rev-parse", "HEAD"), "worktree_clean": not bool(run("status", "--porcelain"))}
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(repo), *args],
+                text=True,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+            ).strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"could not inspect source repository: {repo}") from exc
+
+    return {
+        "commit": run("rev-parse", "HEAD"),
+        "worktree_clean": not bool(run("status", "--porcelain")),
+    }
 
 
 def _config() -> dict[str, Any]:
-    cfg = _load(_config_path())
+    config = _load(_config_path())
     allowed = {
-        "repo_root", "output_root", "max_source_bytes", "primary_horizon",
-        "min_positive_events", "min_decay_events_per_horizon", "cost_scenarios",
-        "capacity_participation_rates", "impact_coefficient_bps", "max_position_cap",
-        "single_name_cap", "require_clean_worktree",
+        "repo_root",
+        "output_root",
+        "max_source_bytes",
+        "max_position_cap",
+        "single_name_cap",
+        "require_clean_worktree",
+        # Accepted for backward compatibility with the first draft. The dashboard
+        # gate, not this adapter, is now the calculation source of truth.
+        "primary_horizon",
+        "min_positive_events",
+        "min_decay_events_per_horizon",
+        "cost_scenarios",
+        "capacity_participation_rates",
+        "impact_coefficient_bps",
     }
-    unknown = sorted(set(cfg) - allowed)
+    unknown = sorted(set(config) - allowed)
     if unknown:
         raise ValueError(f"unknown configuration fields: {', '.join(unknown)}")
-    cfg["repo_root"] = str(Path(cfg["repo_root"]).expanduser().resolve())
-    cfg["output_root"] = str(Path(cfg.get("output_root", "~/.vibe-trading/a-share-rank-research")).expanduser().resolve())
-    return cfg
+    if not config.get("repo_root"):
+        raise ValueError("repo_root is required")
+    config["repo_root"] = str(Path(config["repo_root"]).expanduser().resolve())
+    config["output_root"] = str(
+        Path(config.get("output_root", "~/.vibe-trading/a-share-rank-research"))
+        .expanduser()
+        .resolve()
+    )
+    maximum = int(_number(config.get("max_source_bytes")) or 25_000_000)
+    if maximum < 1:
+        raise ValueError("max_source_bytes must be positive")
+    config["max_source_bytes"] = maximum
+    max_cap = _number(config.get("max_position_cap"))
+    single_cap = _number(config.get("single_name_cap"))
+    config["max_position_cap"] = 0.20 if max_cap is None else max_cap
+    config["single_name_cap"] = 0.05 if single_cap is None else single_cap
+    if not 0 <= config["max_position_cap"] <= 1:
+        raise ValueError("max_position_cap must be between 0 and 1")
+    if not 0 <= config["single_name_cap"] <= config["max_position_cap"]:
+        raise ValueError("single_name_cap must be between 0 and max_position_cap")
+    config["require_clean_worktree"] = bool(config.get("require_clean_worktree", True))
+    return config
 
 
-def _net_return(entry: float, close: float, buy_bps: float, sell_bps: float) -> float:
-    return 100 * ((close * (1 - sell_bps / 10000)) / (entry * (1 + buy_bps / 10000)) - 1)
+def _position_caps(watch: Mapping[str, Any], config: Mapping[str, Any]) -> tuple[float, float]:
+    decision = (
+        watch.get("decision_summary")
+        if isinstance(watch.get("decision_summary"), Mapping)
+        else {}
+    )
+    guidance = (
+        decision.get("position_guidance")
+        if isinstance(decision.get("position_guidance"), Mapping)
+        else {}
+    )
+    upper_pct = _number(guidance.get("upper_pct"))
+    single_pct = _number(guidance.get("single_name_cap_pct"))
+    if upper_pct is None:
+        return 0.0, 0.0
+    total = min(float(config["max_position_cap"]), max(0.0, upper_pct / 100))
+    if single_pct is None:
+        single = min(float(config["single_name_cap"]), total)
+    else:
+        single = min(
+            float(config["single_name_cap"]),
+            total,
+            max(0.0, single_pct / 100),
+        )
+    return total, single
 
 
-def _summary(values: list[float]) -> dict[str, Any]:
-    return {
-        "events": len(values),
-        "mean_pct": mean(values) if values else None,
-        "median_pct": median(values) if values else None,
-        "win_rate_pct": 100 * sum(v > 0 for v in values) / len(values) if values else None,
-    }
+def _validate_gate(gate: Mapping[str, Any], source_date: str) -> None:
+    if gate.get("method") != "max_dama_research_gate_v1":
+        raise ValueError(
+            "main_rise_audit.json lacks max_dama_research_gate_v1; "
+            "merge/run the dashboard gate before creating a Vibe snapshot"
+        )
+    if str(gate.get("as_of") or "") != source_date:
+        raise ValueError("Max Dama gate date does not match the watch date")
+    if not isinstance(gate.get("checks"), list):
+        raise ValueError("Max Dama gate lacks checks")
+    policies = gate.get("policies") if isinstance(gate.get("policies"), Mapping) else {}
+    if policies.get("live_execution_allowed") is not False:
+        raise ValueError("Max Dama gate must explicitly disable live execution")
 
 
 def build_snapshot(as_of: str | None = None) -> dict[str, Any]:
-    cfg = _config()
-    repo = Path(cfg["repo_root"])
+    config = _config()
+    repo = Path(config["repo_root"])
     files = {
         "watch": repo / "main_rise_watch.json",
         "audit": repo / "main_rise_audit.json",
@@ -95,10 +179,12 @@ def build_snapshot(as_of: str | None = None) -> dict[str, Any]:
     for path in files.values():
         if not path.is_file():
             raise ValueError(f"required source file missing: {path}")
-        if path.stat().st_size > int(cfg.get("max_source_bytes", 25_000_000)):
+        if path.stat().st_size > config["max_source_bytes"]:
             raise ValueError(f"source file exceeds configured size limit: {path}")
 
-    watch, audit, outcomes = (_load(files[key]) for key in ("watch", "audit", "outcomes"))
+    watch = _load(files["watch"])
+    audit = _load(files["audit"])
+    outcomes = _load(files["outcomes"])
     source_date = str(watch.get("as_of") or watch.get("data_trade_date") or "")
     if not (len(source_date) == 8 and source_date.isdigit()):
         raise ValueError("watch artifact lacks YYYYMMDD as_of")
@@ -109,111 +195,196 @@ def build_snapshot(as_of: str | None = None) -> dict[str, Any]:
         if dated and dated != source_date:
             raise ValueError(f"{label} date mismatch: {dated} != {source_date}")
 
-    git = _git(repo)
-    if cfg.get("require_clean_worktree", True) and not git["worktree_clean"]:
+    repository = _git(repo)
+    if config["require_clean_worktree"] and not repository["worktree_clean"]:
         raise ValueError("source repository worktree is not clean")
+    gate = (
+        audit.get("max_dama_research_gate")
+        if isinstance(audit.get("max_dama_research_gate"), Mapping)
+        else {}
+    )
+    _validate_gate(gate, source_date)
 
-    events = outcomes.get("events") if isinstance(outcomes.get("events"), dict) else {}
-    rows: list[dict[str, Any]] = []
-    grouped: dict[str, dict[int, list[float]]] = {}
-    missing = 0
-    for event in events.values():
-        if not isinstance(event, dict) or event.get("state") not in (*POSITIVE_STATES, "overheat_isolation"):
-            continue
-        state = str(event["state"])
-        horizons = event.get("horizons") if isinstance(event.get("horizons"), dict) else {}
-        for horizon in HORIZONS:
-            result = horizons.get(str(horizon))
-            if not isinstance(result, dict) or result.get("status") != "complete":
-                missing += 1
-                continue
-            entry = _number(result.get("entry_open"))
-            close = _number(result.get("target_close"))
-            if not entry or not close:
-                missing += 1
-                continue
-            item = {"state": state, "horizon": horizon, "return_pct": _number(result.get("return_pct")), "excess_return_pct": _number(result.get("excess_return_pct")), "cost_scenarios": {}}
-            for name, scenario in cfg.get("cost_scenarios", {}).items():
-                net = _net_return(entry, close, float(scenario["buy_cost_bps"]), float(scenario["sell_cost_bps"]))
-                item["cost_scenarios"][name] = {"net_return_pct": net}
-                if state in POSITIVE_STATES:
-                    grouped.setdefault(name, {}).setdefault(horizon, []).append(net)
-            rows.append(item)
+    sample = gate.get("sample") if isinstance(gate.get("sample"), Mapping) else {}
+    execution = gate.get("execution") if isinstance(gate.get("execution"), Mapping) else {}
+    risk = gate.get("risk") if isinstance(gate.get("risk"), Mapping) else {}
+    capacity = gate.get("capacity") if isinstance(gate.get("capacity"), Mapping) else {}
+    gate_policies = gate.get("policies") if isinstance(gate.get("policies"), Mapping) else {}
+    total_cap, single_cap = _position_caps(watch, config)
+    fixed_cost_name = "dashboard_fixed_cost"
+    fixed_cost = execution.get("round_trip_cost_bps")
 
-    summaries = {name: {str(h): _summary(values.get(h, [])) for h in HORIZONS} for name, values in grouped.items()}
-    validation = audit.get("validation") if isinstance(audit.get("validation"), dict) else {}
-    primary = int(cfg.get("primary_horizon", 5))
-    primary_events = sum(1 for row in rows if row["state"] in POSITIVE_STATES and row["horizon"] == primary)
+    manifest = {
+        name: {"path": str(path), "sha256": _sha(path)} for name, path in files.items()
+    }
+    stable_config = {
+        "max_source_bytes": config["max_source_bytes"],
+        "max_position_cap": config["max_position_cap"],
+        "single_name_cap": config["single_name_cap"],
+        "require_clean_worktree": config["require_clean_worktree"],
+    }
+    identity_input = {
+        "tool_version": TOOL_VERSION,
+        "date": source_date,
+        "git_commit": repository["commit"],
+        "source_hashes": {name: value["sha256"] for name, value in manifest.items()},
+        "dashboard_gate_run_id": gate.get("run_id"),
+        "adapter_parameters": stable_config,
+    }
+    run_id = _json_sha(identity_input)[:20]
+    run_dir = Path(config["output_root"]) / run_id
 
-    pool = watch.get("pools") if isinstance(watch.get("pools"), dict) else {}
-    positive_count = sum(len(pool.get(state) or []) for state in POSITIVE_STATES)
-    if len(pool.get("breakout_watch") or []) > 0:
-        cap = min(float(cfg.get("max_position_cap", .20)), .20)
-    elif len(pool.get("pre_breakout_watch") or []) > 0:
-        cap = min(float(cfg.get("max_position_cap", .20)), .10)
-    elif positive_count:
-        cap = min(float(cfg.get("max_position_cap", .20)), .05)
-    else:
-        cap = 0.0
-
-    manifest = {name: {"path": str(path), "sha256": _sha(path)} for name, path in files.items()}
-    identity = hashlib.sha256(json.dumps({"date": source_date, "git": git, "manifest": manifest, "config": cfg}, sort_keys=True).encode()).hexdigest()[:20]
-    run_dir = Path(cfg["output_root"]) / identity
+    cost_positive = (
+        gate.get("cost_adjusted_positive")
+        if isinstance(gate.get("cost_adjusted_positive"), Mapping)
+        else {}
+    )
+    alpha_decay = gate.get("alpha_decay") if isinstance(gate.get("alpha_decay"), Mapping) else {}
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "engine": "a_share_rank_tracker",
-        "run_id": identity,
+        "run_id": run_id,
         "as_of": source_date,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": {"repository": git, "manifest": manifest},
-        "metrics": {
-            "validation_status": validation.get("status", "collecting"),
-            "positive_observations": positive_count,
-            "completed_rows": len(rows),
-            "missing_or_incomplete_rows": missing,
-            "primary_horizon": primary,
-            "primary_horizon_positive_events": primary_events,
-            "cost_adjusted": summaries,
+        "source": {
+            "repository": repository,
+            "manifest": manifest,
+            "dashboard_gate_run_id": gate.get("run_id"),
+            "identity_sha256": _json_sha(identity_input),
         },
-        "risk": {"validation_status": "event_level_only", "new_total_exposure_cap": cap, "single_name_cap": float(cfg.get("single_name_cap", .05))},
-        "capacity": {"validation_status": "diagnostic_only", "estimated_capacity": None, "participation_rates": cfg.get("capacity_participation_rates", [])},
-        "policies": {"automatic_tuning": "disabled", "live_execution_allowed": False, "interpretation": "research_only_not_a_buy_signal"},
+        "metrics": {
+            "validation_status": sample.get("validation_status", "collecting"),
+            "signal_days_with_completed_outcomes": int(
+                sample.get("signal_days_with_completed_outcomes") or 0
+            ),
+            "positive_completed_event_horizons": int(
+                sample.get("positive_completed_event_horizons") or 0
+            ),
+            "pending_rows": int(sample.get("pending_rows") or 0),
+            "unavailable_rows": int(sample.get("unavailable_rows") or 0),
+            "malformed_complete_rows": int(
+                sample.get("malformed_complete_rows") or 0
+            ),
+            "primary_horizon": int(gate.get("primary_horizon") or 0),
+            "primary_horizon_positive_events": int(
+                sample.get("primary_horizon_positive_events") or 0
+            ),
+            "minimum_primary_events": int(gate.get("minimum_primary_events") or 0),
+            "cost_adjusted": {fixed_cost_name: cost_positive},
+            "alpha_decay": {fixed_cost_name: alpha_decay},
+        },
+        "execution": {
+            **dict(execution),
+            "cost_scenarios": {
+                fixed_cost_name: {
+                    "round_trip_cost_bps": fixed_cost,
+                    "description": "fixed dashboard research assumption",
+                }
+            },
+        },
+        "risk": {
+            **dict(risk),
+            "new_total_exposure_cap": total_cap,
+            "single_name_cap": single_cap,
+        },
+        "capacity": dict(capacity),
+        "policies": {
+            "automatic_tuning": gate_policies.get("automatic_tuning", "disabled"),
+            "live_execution_allowed": False,
+            "interpretation": "research_only_not_a_buy_signal",
+        },
+        "dashboard_gate": dict(gate),
     }
-    _write(run_dir / "request.json", {"as_of": as_of})
-    _write(run_dir / "source_manifest.json", manifest)
-    _write(run_dir / "event_outcomes.normalized.json", {"rows": rows})
+
+    _write(run_dir / "request.json", {"as_of": as_of, "resolved_as_of": source_date})
+    _write(run_dir / "source_manifest.json", result["source"])
+    _write(
+        run_dir / "event_outcomes.normalized.json",
+        {
+            "source": "main_rise_audit.json#max_dama_research_gate",
+            "cost_adjusted_positive": cost_positive,
+        },
+    )
+    _write(
+        run_dir / "cost_capacity_diagnostics.json",
+        {
+            "alpha_decay": alpha_decay,
+            "execution": result["execution"],
+            "capacity": result["capacity"],
+        },
+    )
     _write(run_dir / "result.normalized.json", result)
+    _write(
+        run_dir / "process.json",
+        {
+            "status": "complete",
+            "tool_version": TOOL_VERSION,
+            "run_id": run_id,
+            "dashboard_gate_run_id": gate.get("run_id"),
+            "result_sha256": _sha(run_dir / "result.normalized.json"),
+            "live_execution_allowed": False,
+        },
+    )
     return result
 
 
 class AShareRankResearchInfoTool(BaseTool):
     name = "a_share_rank_research_info"
-    description = "Inspect the fixed read-only a-share-rank-tracker research adapter configuration."
+    description = "Inspect the fixed dashboard-gate research adapter configuration."
     parameters = {"type": "object", "properties": {}, "required": []}
     repeatable = True
     is_readonly = True
 
     def execute(self, **_: Any) -> str:
         try:
-            cfg = _config()
-            repo = Path(cfg["repo_root"])
-            return json.dumps({"status": "ok", "configured": True, "config_path": str(_config_path()), "repo_root": str(repo), "repository": _git(repo), "output_root": cfg["output_root"], "research_only": True, "live_execution_allowed": False}, ensure_ascii=False)
+            config = _config()
+            repo = Path(config["repo_root"])
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "configured": True,
+                    "config_path": str(_config_path()),
+                    "repo_root": str(repo),
+                    "repository": _git(repo),
+                    "output_root": config["output_root"],
+                    "calculation_source": "main_rise_audit.json#max_dama_research_gate",
+                    "research_only": True,
+                    "live_execution_allowed": False,
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
-            return json.dumps({"status": "error", "configured": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps(
+                {"status": "error", "configured": False, "error": str(exc)},
+                ensure_ascii=False,
+            )
 
 
 class AShareRankResearchSnapshotTool(BaseTool):
     name = "a_share_rank_research_snapshot"
-    description = "Create a reproducible cost-adjusted research snapshot from fixed A-share artifacts; no paths or orders accepted."
-    parameters = {"type": "object", "properties": {"as_of": {"type": "string", "pattern": "^[0-9]{8}$"}}, "required": [], "additionalProperties": False}
+    description = "Freeze the dashboard Max Dama gate as a reproducible Vibe research run; no paths or orders accepted."
+    parameters = {
+        "type": "object",
+        "properties": {"as_of": {"type": "string", "pattern": "^[0-9]{8}$"}},
+        "required": [],
+        "additionalProperties": False,
+    }
     repeatable = True
     is_readonly = False
 
     def execute(self, **kwargs: Any) -> str:
         try:
-            return json.dumps({"status": "ok", **build_snapshot(kwargs.get("as_of"))}, ensure_ascii=False, allow_nan=False)
+            return json.dumps(
+                {"status": "ok", **build_snapshot(kwargs.get("as_of"))},
+                ensure_ascii=False,
+                allow_nan=False,
+            )
         except Exception as exc:
             return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
 
 
-__all__ = ["AShareRankResearchInfoTool", "AShareRankResearchSnapshotTool", "build_snapshot"]
+__all__ = [
+    "AShareRankResearchInfoTool",
+    "AShareRankResearchSnapshotTool",
+    "build_snapshot",
+]
