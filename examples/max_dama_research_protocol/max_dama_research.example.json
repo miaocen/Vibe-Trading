@@ -1,0 +1,6 @@
+{
+  "engine_roots": {
+    "a_share_rank_tracker": "~/.vibe-trading/a-share-rank-research"
+  },
+  "minimum_primary_events": 30
+}
