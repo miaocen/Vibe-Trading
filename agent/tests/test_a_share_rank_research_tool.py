@@ -23,9 +23,10 @@ def test_build_snapshot_is_research_only(tmp_path, monkeypatch):
         "as_of": "20260717",
         "events": {"x": {"state": "breakout_watch", "horizons": {"5": {"status": "complete", "entry_open": 10, "target_close": 11, "return_pct": 10, "excess_return_pct": 8}}}},
     })
+    output_root = tmp_path / "runs"
     config = tmp_path / ".vibe-trading" / "a_share_rank_research.json"
     write(config, {
-        "repo_root": str(repo), "output_root": str(tmp_path / "runs"), "primary_horizon": 5,
+        "repo_root": str(repo), "output_root": str(output_root), "primary_horizon": 5,
         "min_positive_events": 30, "min_decay_events_per_horizon": 30,
         "cost_scenarios": {"baseline": {"buy_cost_bps": 8, "sell_cost_bps": 13, "description": "test"}},
         "capacity_participation_rates": [0.01], "impact_coefficient_bps": 25,
@@ -38,4 +39,4 @@ def test_build_snapshot_is_research_only(tmp_path, monkeypatch):
     assert result["metrics"]["primary_horizon_positive_events"] == 1
     assert result["risk"]["new_total_exposure_cap"] == 0.2
     assert result["policies"]["live_execution_allowed"] is False
-    assert (Path(config.parent / "a-share-rank-research") / result["run_id"] / "result.normalized.json").is_file()
+    assert (output_root / result["run_id"] / "result.normalized.json").is_file()
