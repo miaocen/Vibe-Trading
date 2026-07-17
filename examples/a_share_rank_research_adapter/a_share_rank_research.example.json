@@ -2,28 +2,6 @@
   "repo_root": "/ABSOLUTE/PATH/TO/a-share-rank-tracker",
   "output_root": "~/.vibe-trading/a-share-rank-research",
   "max_source_bytes": 25000000,
-  "primary_horizon": 5,
-  "min_positive_events": 30,
-  "min_decay_events_per_horizon": 30,
-  "cost_scenarios": {
-    "baseline": {
-      "buy_cost_bps": 8,
-      "sell_cost_bps": 13,
-      "description": "操作员维护的全成本基准假设；不是对当前法定税费或实际券商成交的声明"
-    },
-    "stress": {
-      "buy_cost_bps": 18,
-      "sell_cost_bps": 23,
-      "description": "价差与滑点扩大的压力情景"
-    },
-    "severe": {
-      "buy_cost_bps": 35,
-      "sell_cost_bps": 40,
-      "description": "流动性恶化时的严重压力情景"
-    }
-  },
-  "capacity_participation_rates": [0.01, 0.05, 0.10],
-  "impact_coefficient_bps": 25,
   "max_position_cap": 0.20,
   "single_name_cap": 0.05,
   "require_clean_worktree": true
