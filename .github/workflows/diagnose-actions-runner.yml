@@ -1,0 +1,20 @@
+name: Diagnose GitHub-hosted runner
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/diagnose-actions-runner.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Confirm runner acquisition
+        run: |
+          echo "runner_started=true"
+          echo "repository=${GITHUB_REPOSITORY}"
+          echo "event=${GITHUB_EVENT_NAME}"
